@@ -1,0 +1,22 @@
+name: 'crypto_streaming'
+version: '1.0.0'
+config-version: 2
+
+profile: 'crypto_streaming'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  crypto_streaming:
+    staging:
+      +materialized: view
+      +schema: silver
+    gold:
+      +materialized: incremental
+      +schema: gold
+      +unique_key: surrogate_key
+      +incremental_strategy: delete+insert

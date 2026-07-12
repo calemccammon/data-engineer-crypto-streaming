@@ -1,0 +1,32 @@
+version: 2
+
+sources:
+  - name: silver
+    schema: silver
+    description: "Silver layer tables produced by the micro-batch processor"
+    tables:
+      - name: ohlcv_1m
+        description: "1-minute OHLCV candles per symbol"
+        columns:
+          - name: symbol
+            tests: [not_null]
+          - name: candle_open
+            tests: [not_null]
+          - name: close_price
+            tests: [not_null]
+          - name: volume
+            tests: [not_null]
+          - name: vwap
+            tests: [not_null]
+
+      - name: trades_clean
+        description: "Deduplicated trades from Bronze"
+        columns:
+          - name: trade_id
+            tests: [not_null, unique]
+          - name: side
+            tests:
+              - accepted_values:
+                  name: accepted_values_trades_clean_side
+                  config:
+                    values: ['buy', 'sell']

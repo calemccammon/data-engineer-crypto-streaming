@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: gold_vwap
+    description: "VWAP and candle metrics per symbol per minute"
+    columns:
+      - name: surrogate_key
+        tests: [not_null, unique]
+      - name: vwap
+        tests: [not_null]
+      - name: volume
+        tests: [not_null]
+
+  - name: gold_rolling_volatility
+    description: "Realized volatility over 5m, 15m, and 1h rolling windows"
+    columns:
+      - name: surrogate_key
+        tests: [not_null, unique]
+
+  - name: gold_trade_flow
+    description: "Buy/sell pressure and order flow imbalance per candle"
+    columns:
+      - name: surrogate_key
+        tests: [not_null, unique]
+      - name: order_flow_imbalance
+        description: "Ranges from -1 (all sells) to +1 (all buys)"
+
+  - name: gold_symbol_summary
+    description: "Latest price, session stats, and VWAP per symbol"
+    columns:
+      - name: symbol
+        tests: [not_null, unique]
+      - name: latest_price
+        tests: [not_null]

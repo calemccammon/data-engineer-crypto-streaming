@@ -1,0 +1,7 @@
+crypto_streaming:
+  target: duckdb
+  outputs:
+    duckdb:
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', '../data/crypto.duckdb') }}"
+      schema: gold

@@ -1,0 +1,51 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: crypto-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"   # Kafka-compatible external listener
+      - "18082:18082"   # Pandaproxy (REST)
+      - "18081:18081"   # Schema Registry
+      - "9644:9644"     # Admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: crypto-redpanda-console
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  redpanda-init:
+    image: redpandadata/redpanda:latest
+    container_name: crypto-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        rpk topic create raw-trades --brokers redpanda:9092 --partitions 3 --replicas 1 || true
+        echo "Topics created."
+    restart: "no"

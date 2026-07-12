@@ -1,0 +1,48 @@
+[project]
+name = "data-engineer-crypto-streaming"
+version = "0.1.0"
+description = "Real-time crypto streaming pipeline: Binance WebSocket → Kafka → Medallion (Bronze/Silver/Gold) → Streamlit dashboard"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Streaming ingestion
+    "websockets>=12.0",
+    "confluent-kafka>=2.4.0",
+    # Data validation / contracts
+    "pydantic>=2.7",
+    # Storage
+    "duckdb>=1.0.0",
+    "pyarrow>=16.0",
+    # dbt
+    "dbt-core>=1.8",
+    "dbt-duckdb>=1.8",
+    # Orchestration
+    "dagster>=1.7",
+    "dagster-dbt>=0.23",
+    "dagster-webserver>=1.7",
+    # Dashboard
+    "streamlit>=1.35",
+    "plotly>=5.22",
+    # Utilities
+    "python-dotenv>=1.0",
+    "tenacity>=8.3",       # Retry logic for WebSocket reconnects
+    "structlog>=24.1",     # Structured logging
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ingest", "consume", "orchestrate"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
