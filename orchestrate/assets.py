@@ -16,16 +16,14 @@ import duckdb
 import structlog
 from dagster import (
     AssetExecutionContext,
-    AssetMaterialization,
+    AssetSpec,
     MetadataValue,
     Output,
     asset,
-    external_asset_from_spec,
-    AssetSpec,
 )
 from dotenv import load_dotenv
 
-from consume.silver_processor import run_processor, _init_silver
+from consume.silver_processor import run_processor
 
 load_dotenv()
 
@@ -36,12 +34,12 @@ TRANSFORM_DIR = Path(__file__).parent.parent / "transform"
 
 
 # --- External asset: Bronze is written by the always-on Kafka consumer ---
-bronze_raw_trades = external_asset_from_spec(
-    AssetSpec(
-        key="bronze_raw_trades",
-        description="Raw trades written by the Kafka bronze consumer. Always running.",
-        metadata={"duckdb_table": "bronze.raw_trades"},
-    )
+# An AssetSpec with no compute function is an external asset: Dagster shows it in
+# the graph and never tries to materialize it.
+bronze_raw_trades = AssetSpec(
+    key="bronze_raw_trades",
+    description="Raw trades written by the Kafka bronze consumer. Always running.",
+    metadata={"duckdb_table": "raw.raw_trades", "parquet_dir": "data/bronze"},
 )
 
 
@@ -73,9 +71,13 @@ def silver_candles(context: AssetExecutionContext) -> Output[dict]:
 
 def _run_dbt(command: list[str]) -> None:
     """Run a dbt command inside the transform directory."""
+    # dbt runs with transform/ as its working directory, so a relative DUCKDB_PATH
+    # would point at a different file there. Pass the path this process uses.
+    env = {**os.environ, "DUCKDB_PATH": str(Path(DUCKDB_PATH).resolve())}
     result = subprocess.run(
         ["dbt"] + command + ["--profiles-dir", "."],
         cwd=str(TRANSFORM_DIR),
+        env=env,
         capture_output=True,
         text=True,
     )

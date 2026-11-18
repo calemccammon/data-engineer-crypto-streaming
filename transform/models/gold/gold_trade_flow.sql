@@ -6,7 +6,9 @@
 --   OFI = (buy_volume - sell_volume) / total_volume
 --   +1.0 = entirely buy-driven, -1.0 = entirely sell-driven, 0 = balanced
 --
--- Demonstrates: derived metrics from streaming aggregations.
+-- The rolling sum is computed over every candle in Silver, and the incremental
+-- filter is applied afterwards. Filtering first would cut the window short for
+-- the earliest rows of each run.
 
 {{
   config(
@@ -16,15 +18,7 @@
   )
 }}
 
-WITH candles AS (
-    SELECT *
-    FROM {{ ref('stg_candles') }}
-
-    {% if is_incremental() %}
-    WHERE updated_at > (SELECT MAX(updated_at) - INTERVAL '2 minutes' FROM {{ this }})
-    {% endif %}
-)
-
+WITH flow AS (
 SELECT
     symbol || '_' || CAST(candle_open AS VARCHAR)                AS surrogate_key,
     symbol,
@@ -47,4 +41,18 @@ SELECT
     )                                                           AS cumulative_ofi_5m,
 
     updated_at
-FROM candles
+FROM {{ ref('stg_candles') }}
+)
+
+SELECT *
+FROM flow
+
+{% if is_incremental() %}
+-- Silver only rewrites candles from the last few minutes, and a rewritten candle
+-- changes the rolling sum of the 4 candles after it. Re-emitting the newest
+-- 10 minutes covers both. The COALESCE covers a Gold table that is still empty.
+WHERE candle_open > (
+    SELECT COALESCE(MAX(candle_open), TIMESTAMPTZ '1970-01-01 00:00:00+00') - INTERVAL '10 minutes'
+    FROM {{ this }}
+)
+{% endif %}

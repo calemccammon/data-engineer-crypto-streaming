@@ -1,9 +1,7 @@
 -- gold_symbol_summary.sql
 --
 -- Latest snapshot per symbol: current price, recent volume, session high/low.
--- Refreshed on every dbt run — shows the "right now" state of each symbol.
---
--- Demonstrates: non-incremental Gold model (always full-refresh from Silver).
+-- Not incremental: rebuilt in full from Silver on every dbt run.
 
 {{
   config(
@@ -37,7 +35,7 @@ session_stats AS (
         -- Session VWAP
         SUM(vwap * volume) / NULLIF(SUM(volume), 0)         AS session_vwap,
         -- First price of the session
-        FIRST(close_price ORDER BY candle_open)              AS session_open_price
+        FIRST(open_price ORDER BY candle_open)               AS session_open_price
     FROM {{ ref('stg_candles') }}
     GROUP BY symbol
 )

@@ -26,7 +26,7 @@ class TradeEvent(BaseModel):
     price: float
     quantity: float
     trade_time: datetime
-    received_at: datetime
+    received_at: datetime  # set by the producer when it parses the message
     is_buyer_maker: bool  # True = sell-initiated (maker is buyer), False = buy-initiated
 
     @field_validator("symbol")
@@ -37,14 +37,16 @@ class TradeEvent(BaseModel):
     @classmethod
     def from_binance(cls, raw: dict) -> "TradeEvent":
         """Parse a raw Binance aggTrade message into a TradeEvent."""
+        # Fields are handed to Pydantic as received (price and quantity arrive as
+        # strings), so a missing or malformed field raises ValidationError.
         return cls(
-            trade_id=raw["a"],
-            symbol=raw["s"],
-            price=float(raw["p"]),
-            quantity=float(raw["q"]),
+            trade_id=raw.get("a"),
+            symbol=raw.get("s"),
+            price=raw.get("p"),
+            quantity=raw.get("q"),
             trade_time=datetime.fromtimestamp(raw["T"] / 1000, tz=timezone.utc),
             received_at=datetime.now(tz=timezone.utc),
-            is_buyer_maker=raw["m"],
+            is_buyer_maker=raw.get("m"),
         )
 
     def to_kafka_value(self) -> dict:

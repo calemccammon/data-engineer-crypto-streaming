@@ -1,7 +1,8 @@
 """Unit tests for ingest/schemas.py — Pydantic TradeEvent validation."""
 
 import pytest
-from datetime import timezone
+from pydantic import ValidationError
+
 from ingest.schemas import TradeEvent
 
 
@@ -54,11 +55,13 @@ def test_to_kafka_value_is_json_serialisable():
 def test_invalid_price_string_raises():
     raw = VALID_RAW.copy()
     raw["p"] = "not_a_number"
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as excinfo:
         TradeEvent.from_binance(raw)
+    assert [err["loc"] for err in excinfo.value.errors()] == [("price",)]
 
 
 def test_missing_field_raises():
     raw = {k: v for k, v in VALID_RAW.items() if k != "a"}  # drop trade_id
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as excinfo:
         TradeEvent.from_binance(raw)
+    assert [err["loc"] for err in excinfo.value.errors()] == [("trade_id",)]
