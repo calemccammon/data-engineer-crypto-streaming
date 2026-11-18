@@ -2,9 +2,8 @@
 --
 -- Volume-Weighted Average Price per symbol per minute.
 --
--- Demonstrates: dbt incremental model with delete+insert strategy.
--- On each run, we only reprocess candles that were updated in the last
--- LATE_ARRIVAL_WINDOW_SECONDS to handle late-arriving events.
+-- Incremental with delete+insert. Each run reprocesses the candles Silver has
+-- rewritten since the last run, which is how late-arriving trades reach Gold.
 
 {{
   config(
@@ -19,8 +18,12 @@ WITH candles AS (
     FROM {{ ref('stg_candles') }}
 
     {% if is_incremental() %}
-    -- Only process candles updated since the last dbt run (+ 2-minute buffer)
-    WHERE updated_at > (SELECT MAX(updated_at) - INTERVAL '2 minutes' FROM {{ this }})
+    -- Only process candles updated since the last dbt run (+ 2-minute buffer).
+    -- The COALESCE covers a Gold table that exists but is still empty.
+    WHERE updated_at > (
+        SELECT COALESCE(MAX(updated_at), TIMESTAMPTZ '1970-01-01 00:00:00+00') - INTERVAL '2 minutes'
+        FROM {{ this }}
+    )
     {% endif %}
 )
 

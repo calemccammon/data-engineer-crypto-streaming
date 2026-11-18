@@ -2,11 +2,13 @@
 Kafka → Bronze consumer.
 
 Reads trade events from the `raw-trades` Kafka topic and writes them to:
-  1. DuckDB `bronze.raw_trades` table (append-only, deduped by trade_id)
+  1. DuckDB `raw.raw_trades` table in data/bronze.duckdb (append-only, deduped by symbol and trade_id)
   2. Rolling Parquet snapshots in data/bronze/ (every PARQUET_FLUSH_ROWS rows)
 
 Bronze is the landing zone — data is written as-is with minimal transformation.
-The only guarantee Bronze makes is uniqueness on trade_id.
+The only guarantee the DuckDB table makes is uniqueness on (symbol, trade_id).
+The Parquet files can repeat a trade when Kafka redelivers it. The Silver
+processor collapses those on read.
 
 Usage:
     uv run python -m consume.bronze_consumer
@@ -15,7 +17,6 @@ Usage:
 import json
 import os
 import signal
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,7 @@ BRONZE_DIR = DATA_DIR / "bronze"
 # Write a Parquet snapshot every N rows (configurable, default 5000)
 PARQUET_FLUSH_ROWS = int(os.getenv("PARQUET_FLUSH_ROWS", "5000"))
 
-# Bronze table schema — matches TradeEvent exactly
+# Parquet schema for the Bronze snapshots. Matches TradeEvent.
 BRONZE_SCHEMA = pa.schema(
     [
         pa.field("trade_id", pa.int64()),
@@ -63,13 +64,15 @@ def _init_duckdb(path: str) -> duckdb.DuckDBPyConnection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS raw.raw_trades (
-            trade_id        BIGINT PRIMARY KEY,
+            trade_id        BIGINT NOT NULL,
             symbol          VARCHAR NOT NULL,
             price           DOUBLE NOT NULL,
             quantity        DOUBLE NOT NULL,
             trade_time      TIMESTAMPTZ NOT NULL,
             received_at     TIMESTAMPTZ NOT NULL,
-            is_buyer_maker  BOOLEAN NOT NULL
+            is_buyer_maker  BOOLEAN NOT NULL,
+            -- Binance aggregate trade IDs are only unique within a symbol
+            PRIMARY KEY (symbol, trade_id)
         )
         """
     )
@@ -98,12 +101,16 @@ def _flush_parquet(rows: list[dict], symbol_hint: str) -> None:
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S")
     path = BRONZE_DIR / f"trades_{symbol_hint}_{ts}.parquet"
-    # Convert timestamp strings to datetime, let PyArrow infer the rest
-    import pandas as pd
-    df = pd.DataFrame(rows)
-    df["trade_time"] = pd.to_datetime(df["trade_time"], utc=True)
-    df["received_at"] = pd.to_datetime(df["received_at"], utc=True)
-    table = pa.Table.from_pandas(df, preserve_index=False)
+    # Kafka values carry timestamps as ISO-8601 strings; Parquet stores them as timestamps
+    records = [
+        {
+            **row,
+            "trade_time": datetime.fromisoformat(row["trade_time"]),
+            "received_at": datetime.fromisoformat(row["received_at"]),
+        }
+        for row in rows
+    ]
+    table = pa.Table.from_pylist(records, schema=BRONZE_SCHEMA)
     pq.write_table(table, str(path), compression="snappy")
     log.info("parquet_flushed", path=str(path), rows=len(rows))
 
@@ -154,7 +161,7 @@ def run_consumer() -> None:
                 log.warning("message_parse_error", error=str(exc))
                 continue
 
-            # Upsert into DuckDB (INSERT OR IGNORE keeps Bronze idempotent)
+            # INSERT OR IGNORE keeps the DuckDB table free of redelivered trades
             conn.execute(
                 """
                 INSERT OR IGNORE INTO raw.raw_trades

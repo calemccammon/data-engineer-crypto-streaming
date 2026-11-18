@@ -23,10 +23,10 @@ sources:
         description: "Deduplicated trades from Bronze"
         columns:
           - name: trade_id
-            tests: [not_null, unique]
+            tests: [not_null]
           - name: side
             tests:
               - accepted_values:
                   name: accepted_values_trades_clean_side
-                  config:
+                  arguments:
                     values: ['buy', 'sell']

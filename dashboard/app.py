@@ -44,15 +44,25 @@ auto_refresh = st.sidebar.toggle("Auto-refresh", value=True)
 st.sidebar.caption(f"Refreshing every {REFRESH_SECONDS}s from DuckDB Gold")
 
 
-
 def query(sql: str, params: list | None = None) -> pd.DataFrame:
+    """
+    Run a read-only query. Returns an empty frame when the database or the table
+    has not been built yet, or when a writer holds the file for this refresh.
+    Any other error is left for Streamlit to display.
+    """
+    if not Path(DUCKDB_PATH).exists():
+        return pd.DataFrame()
     try:
         conn = duckdb.connect(DUCKDB_PATH, read_only=True)
-        df = conn.execute(sql, params or []).df()
-        conn.close()
-        return df
-    except Exception:
+    except duckdb.IOException:
+        st.caption("The database is locked by a writer. Retrying on the next refresh.")
         return pd.DataFrame()
+    try:
+        return conn.execute(sql, params or []).df()
+    except duckdb.CatalogException:
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 
 # --- Main layout ---

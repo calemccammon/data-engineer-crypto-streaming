@@ -9,12 +9,14 @@ locking: the bronze consumer exclusively owns bronze.duckdb for writes, and
 the silver processor reads the same data via the Parquet snapshots it deposits
 in data/bronze/. DuckDB reads Parquet natively and fast via read_parquet().
 
-Key concepts demonstrated:
-- Micro-batch processing (runs every POLL_INTERVAL seconds)
-- Event time bucketing (trades bucketed by the minute they *occurred*, not processed)
-- Late-arrival handling (re-process the last LATE_WINDOW seconds on every run)
-- DuckDB UPSERT (INSERT OR REPLACE for idempotent candle updates)
-- Parquet as an inter-process data exchange format
+How a batch works:
+- Runs every POLL_INTERVAL seconds
+- Trades are bucketed by the minute they occurred (event time), not when they were processed
+- Every batch re-reads trades from LATE_WINDOW seconds before the previous watermark,
+  rounded down to the start of that minute, so each affected candle is rebuilt from
+  all of its trades
+- Candles are written with INSERT OR REPLACE, so re-running a batch is idempotent
+- Trades repeated in the Bronze files are collapsed on (symbol, trade_id)
 
 Usage:
     uv run python -m consume.silver_processor
@@ -27,6 +29,7 @@ Tables written (in data/crypto.duckdb):
 import os
 import signal
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -70,7 +73,7 @@ def _init_silver(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS silver.trades_clean (
-            trade_id        BIGINT PRIMARY KEY,
+            trade_id        BIGINT NOT NULL,
             symbol          VARCHAR NOT NULL,
             price           DOUBLE NOT NULL,
             quantity        DOUBLE NOT NULL,
@@ -78,7 +81,9 @@ def _init_silver(conn: duckdb.DuckDBPyConnection) -> None:
             side            VARCHAR NOT NULL,
             trade_time      TIMESTAMPTZ NOT NULL,
             received_at     TIMESTAMPTZ NOT NULL,
-            candle_open     TIMESTAMPTZ NOT NULL
+            candle_open     TIMESTAMPTZ NOT NULL,
+            -- Binance aggregate trade IDs are only unique within a symbol
+            PRIMARY KEY (symbol, trade_id)
         )
         """
     )
@@ -97,11 +102,11 @@ def _init_silver(conn: duckdb.DuckDBPyConnection) -> None:
     log.info("silver_initialized")
 
 
-def _get_watermark(conn: duckdb.DuckDBPyConnection) -> object:
+def _get_watermark(conn: duckdb.DuckDBPyConnection) -> datetime:
     return conn.execute("SELECT last_processed FROM silver._watermark WHERE id = 1").fetchone()[0]
 
 
-def _set_watermark(conn: duckdb.DuckDBPyConnection, ts: object) -> None:
+def _set_watermark(conn: duckdb.DuckDBPyConnection, ts: datetime) -> None:
     conn.execute("UPDATE silver._watermark SET last_processed = ? WHERE id = 1", [ts])
 
 
@@ -134,20 +139,29 @@ def _process_batch(conn: duckdb.DuckDBPyConnection, from_expr: str | None = None
         if not glob:
             return 0
         source = f"read_parquet('{glob}')"
-        max_ts_source = source
     else:
         source = from_expr
-        max_ts_source = from_expr
 
     watermark = _get_watermark(conn)
 
-    # Count how many new trades are in scope
+    # Start of the minute that contains (watermark - LATE_WINDOW). Candles are
+    # replaced whole, so the batch has to start on a minute boundary or the
+    # first candle would be rebuilt from only part of its trades.
+    cutoff = (watermark - timedelta(seconds=LATE_WINDOW)).replace(second=0, microsecond=0)
+
+    # Trades in scope for this batch, one row per (symbol, trade_id). The same
+    # trade can appear in more than one Bronze file when Kafka redelivers it.
+    in_scope = f"""(
+            SELECT *
+            FROM {source}
+            WHERE trade_time >= ?
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, trade_id ORDER BY received_at) = 1
+        ) AS in_scope"""
+
+    # Count how many trades are in scope
     count_row = conn.execute(
-        f"""
-        SELECT COUNT(*) FROM {source}
-        WHERE trade_time >= (? - INTERVAL (?) SECOND)
-        """,
-        [watermark, LATE_WINDOW],
+        f"SELECT COUNT(*) FROM {in_scope}",
+        [cutoff],
     ).fetchone()
     count = count_row[0] if count_row else 0
 
@@ -168,10 +182,9 @@ def _process_batch(conn: duckdb.DuckDBPyConnection, from_expr: str | None = None
             trade_time,
             received_at,
             date_trunc('minute', trade_time)                       AS candle_open
-        FROM {source}
-        WHERE trade_time >= (? - INTERVAL (?) SECOND)
+        FROM {in_scope}
         """,
-        [watermark, LATE_WINDOW],
+        [cutoff],
     )
 
     # ----- ohlcv_1m upsert — aggregate to 1-minute candles -----
@@ -191,16 +204,15 @@ def _process_batch(conn: duckdb.DuckDBPyConnection, from_expr: str | None = None
             COUNT(*)                                               AS trade_count,
             SUM(price * quantity) / NULLIF(SUM(quantity), 0)      AS vwap,
             NOW()                                                  AS updated_at
-        FROM {source}
-        WHERE trade_time >= (? - INTERVAL (?) SECOND)
+        FROM {in_scope}
         GROUP BY symbol, date_trunc('minute', trade_time)
         """,
-        [watermark, LATE_WINDOW],
+        [cutoff],
     )
 
     # Advance watermark
     max_ts = conn.execute(
-        f"SELECT MAX(trade_time) FROM {max_ts_source}"
+        f"SELECT MAX(trade_time) FROM {source}"
     ).fetchone()[0]
     if max_ts:
         _set_watermark(conn, max_ts)
@@ -213,7 +225,9 @@ def run_processor(once: bool = False) -> None:
     Run the Silver micro-batch processor.
 
     Opens crypto.duckdb only during each batch write, then closes it immediately.
-    This lets the dashboard (and dbt) connect in between runs.
+    This lets the dashboard (and dbt) connect in between runs. If another process
+    holds the file when a batch is due, the batch is skipped and retried on the
+    next poll.
 
     Args:
         once: If True, run a single batch and return (used by Dagster assets).
@@ -230,14 +244,25 @@ def run_processor(once: bool = False) -> None:
         log.info("shutdown_requested")
         running = False
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    # A single batch (the Dagster asset) has no loop to interrupt, and Dagster
+    # may not call this from the main thread, where signal.signal() is required.
+    if not once:
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
 
     log.info("silver_processor_started", poll_interval=POLL_INTERVAL, late_window=LATE_WINDOW)
 
     while running:
         start = time.monotonic()
-        conn = duckdb.connect(DUCKDB_PATH)
+        try:
+            conn = duckdb.connect(DUCKDB_PATH)
+        except duckdb.IOException as exc:
+            # Another process (dbt or the dashboard) has the file open.
+            if once:
+                raise
+            log.warning("duckdb_unavailable_batch_skipped", error=str(exc))
+            time.sleep(POLL_INTERVAL)
+            continue
         try:
             count = _process_batch(conn)
         finally:
