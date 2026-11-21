@@ -2,7 +2,7 @@
 Dagster software-defined assets for the crypto streaming pipeline.
 
 Asset dependency graph:
-    bronze_raw_trades → silver_candles → [gold_vwap, gold_volatility, gold_trade_flow, gold_summary]
+    bronze_raw_trades → silver_candles → gold_models
 
 The Bronze asset is "external" (managed by the running Kafka consumer).
 The Silver and Gold assets are computed on demand / by schedule.
@@ -88,11 +88,14 @@ def _run_dbt(command: list[str]) -> None:
 
 @asset(
     deps=[silver_candles],
-    description="Run dbt incremental models to build the Gold layer",
+    description="Build the dbt project: the staging views, the Gold models and every dbt test",
 )
 def gold_models(context: AssetExecutionContext) -> Output[dict]:
-    _run_dbt(["run", "--select", "gold"])
-    _run_dbt(["test", "--select", "gold"])
+    # `dbt build` runs the staging views the Gold models read before the Gold
+    # models themselves, so this works on a database dbt has never touched. It
+    # also runs each test as soon as what it tests is built, and skips the
+    # models downstream of a failure.
+    _run_dbt(["build"])
 
     conn = duckdb.connect(DUCKDB_PATH, read_only=True)
     vwap_rows = conn.execute("SELECT COUNT(*) FROM gold.gold_vwap").fetchone()[0]

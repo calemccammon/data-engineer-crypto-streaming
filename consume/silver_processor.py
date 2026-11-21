@@ -12,9 +12,11 @@ in data/bronze/. DuckDB reads Parquet natively and fast via read_parquet().
 How a batch works:
 - Runs every POLL_INTERVAL seconds
 - Trades are bucketed by the minute they occurred (event time), not when they were processed
-- Every batch re-reads trades from LATE_WINDOW seconds before the previous watermark,
-  rounded down to the start of that minute, so each affected candle is rebuilt from
-  all of its trades
+- Every batch re-reads each symbol's trades from LATE_WINDOW seconds before that
+  symbol's watermark, rounded down to the start of that minute, so each affected
+  candle is rebuilt from all of its trades
+- The watermark is kept per symbol, so a symbol whose trades are behind the others
+  (after a consumer restart, say) is still read from where it left off
 - Candles are written with INSERT OR REPLACE, so re-running a batch is idempotent
 - Trades repeated in the Bronze files are collapsed on (symbol, trade_id)
 
@@ -29,7 +31,6 @@ Tables written (in data/crypto.duckdb):
 import os
 import signal
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -88,26 +89,20 @@ def _init_silver(conn: duckdb.DuckDBPyConnection) -> None:
         """
     )
 
+    # The latest trade_time each symbol had reached at the end of the previous
+    # batch. A symbol with no row has not been processed yet.
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS silver._watermark (
-            id              INTEGER PRIMARY KEY DEFAULT 1,
-            last_processed  TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01 00:00:00+00'
+        CREATE TABLE IF NOT EXISTS silver._symbol_watermark (
+            symbol          VARCHAR PRIMARY KEY,
+            last_processed  TIMESTAMPTZ NOT NULL
         )
         """
     )
-    conn.execute(
-        "INSERT OR IGNORE INTO silver._watermark (id, last_processed) VALUES (1, '1970-01-01 00:00:00+00')"
-    )
+    # Replaced by the per-symbol table above. Without a watermark the next
+    # batch rebuilds every candle, which is safe.
+    conn.execute("DROP TABLE IF EXISTS silver._watermark")
     log.info("silver_initialized")
-
-
-def _get_watermark(conn: duckdb.DuckDBPyConnection) -> datetime:
-    return conn.execute("SELECT last_processed FROM silver._watermark WHERE id = 1").fetchone()[0]
-
-
-def _set_watermark(conn: duckdb.DuckDBPyConnection, ts: datetime) -> None:
-    conn.execute("UPDATE silver._watermark SET last_processed = ? WHERE id = 1", [ts])
 
 
 def _get_parquet_glob() -> str | None:
@@ -142,80 +137,89 @@ def _process_batch(conn: duckdb.DuckDBPyConnection, from_expr: str | None = None
     else:
         source = from_expr
 
-    watermark = _get_watermark(conn)
-
-    # Start of the minute that contains (watermark - LATE_WINDOW). Candles are
-    # replaced whole, so the batch has to start on a minute boundary or the
-    # first candle would be rebuilt from only part of its trades.
-    cutoff = (watermark - timedelta(seconds=LATE_WINDOW)).replace(second=0, microsecond=0)
-
     # Trades in scope for this batch, one row per (symbol, trade_id). The same
     # trade can appear in more than one Bronze file when Kafka redelivers it.
-    in_scope = f"""(
-            SELECT *
-            FROM {source}
-            WHERE trade_time >= ?
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY symbol, trade_id ORDER BY received_at) = 1
-        ) AS in_scope"""
-
-    # Count how many trades are in scope
-    count_row = conn.execute(
-        f"SELECT COUNT(*) FROM {in_scope}",
-        [cutoff],
-    ).fetchone()
-    count = count_row[0] if count_row else 0
-
+    #
+    # Each symbol is read from the start of the minute that contains (its
+    # watermark - LATE_WINDOW). Candles are replaced whole, so the batch has to
+    # start on a minute boundary or the first candle would be rebuilt from only
+    # part of its trades. The cutoff is per symbol because one cutoff for all of
+    # them would be set by whichever symbol is furthest ahead, and would pass
+    # over trades of the others that had not been read yet.
+    conn.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE batch_trades AS
+        SELECT trades.*
+        FROM {source} AS trades
+        LEFT JOIN silver._symbol_watermark AS watermark USING (symbol)
+        WHERE watermark.last_processed IS NULL
+           OR trades.trade_time >= date_trunc(
+                'minute', watermark.last_processed - to_seconds(CAST(? AS BIGINT)))
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY trades.symbol, trades.trade_id ORDER BY trades.received_at
+        ) = 1
+        """,
+        [LATE_WINDOW],
+    )
+    count = conn.execute("SELECT COUNT(*) FROM batch_trades").fetchone()[0]
     if count == 0:
         return 0
 
-    # ----- trades_clean upsert -----
-    conn.execute(
-        f"""
-        INSERT OR REPLACE INTO silver.trades_clean
-        SELECT
-            trade_id,
-            symbol,
-            price,
-            quantity,
-            price * quantity                                        AS notional_value,
-            CASE WHEN is_buyer_maker THEN 'sell' ELSE 'buy' END    AS side,
-            trade_time,
-            received_at,
-            date_trunc('minute', trade_time)                       AS candle_open
-        FROM {in_scope}
-        """,
-        [cutoff],
-    )
+    # The two tables and the watermarks change together or not at all.
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO silver.trades_clean
+            SELECT
+                trade_id,
+                symbol,
+                price,
+                quantity,
+                price * quantity                                        AS notional_value,
+                CASE WHEN is_buyer_maker THEN 'sell' ELSE 'buy' END    AS side,
+                trade_time,
+                received_at,
+                date_trunc('minute', trade_time)                       AS candle_open
+            FROM batch_trades
+            """
+        )
 
-    # ----- ohlcv_1m upsert — aggregate to 1-minute candles -----
-    conn.execute(
-        f"""
-        INSERT OR REPLACE INTO silver.ohlcv_1m
-        SELECT
-            symbol,
-            date_trunc('minute', trade_time)                       AS candle_open,
-            FIRST(price ORDER BY trade_time)                       AS open_price,
-            MAX(price)                                             AS high_price,
-            MIN(price)                                             AS low_price,
-            LAST(price ORDER BY trade_time)                        AS close_price,
-            SUM(quantity)                                          AS volume,
-            SUM(CASE WHEN NOT is_buyer_maker THEN quantity ELSE 0 END) AS buy_volume,
-            SUM(CASE WHEN is_buyer_maker THEN quantity ELSE 0 END)     AS sell_volume,
-            COUNT(*)                                               AS trade_count,
-            SUM(price * quantity) / NULLIF(SUM(quantity), 0)      AS vwap,
-            NOW()                                                  AS updated_at
-        FROM {in_scope}
-        GROUP BY symbol, date_trunc('minute', trade_time)
-        """,
-        [cutoff],
-    )
+        # Aggregate to 1-minute candles. Trade times are in milliseconds and
+        # several trades can share one, so the trade ID settles which of them
+        # came first: without it open and close could differ between runs.
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO silver.ohlcv_1m
+            SELECT
+                symbol,
+                date_trunc('minute', trade_time)                       AS candle_open,
+                FIRST(price ORDER BY trade_time, trade_id)             AS open_price,
+                MAX(price)                                             AS high_price,
+                MIN(price)                                             AS low_price,
+                LAST(price ORDER BY trade_time, trade_id)              AS close_price,
+                SUM(quantity)                                          AS volume,
+                SUM(CASE WHEN NOT is_buyer_maker THEN quantity ELSE 0 END) AS buy_volume,
+                SUM(CASE WHEN is_buyer_maker THEN quantity ELSE 0 END)     AS sell_volume,
+                COUNT(*)                                               AS trade_count,
+                SUM(price * quantity) / NULLIF(SUM(quantity), 0)      AS vwap,
+                NOW()                                                  AS updated_at
+            FROM batch_trades
+            GROUP BY symbol, date_trunc('minute', trade_time)
+            """
+        )
 
-    # Advance watermark
-    max_ts = conn.execute(
-        f"SELECT MAX(trade_time) FROM {source}"
-    ).fetchone()[0]
-    if max_ts:
-        _set_watermark(conn, max_ts)
+        # Advance each symbol's watermark to its own latest trade
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO silver._symbol_watermark
+            SELECT symbol, MAX(trade_time) FROM batch_trades GROUP BY symbol
+            """
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
     return count
 

@@ -179,3 +179,62 @@ def test_repeated_trade_is_counted_once(conn):
     assert volume == pytest.approx(0.3)
     assert trade_count == 2
     assert conn.execute("SELECT COUNT(*) FROM silver.trades_clean").fetchone()[0] == 2
+
+
+def test_a_symbol_that_is_behind_the_others_is_not_passed_over(conn):
+    """
+    After a consumer restart the symbols are read back unevenly, so one batch can
+    see trades far newer for one symbol than the next batch brings for another.
+    """
+    _insert_trade(conn, 80, "BTCUSDT", 67000.0, 0.1, BASE_TIME + timedelta(minutes=10))
+    _process_batch(conn, from_expr="bronze.raw_trades")
+
+    # ETH's backlog arrives next: ten minutes older than the newest BTC trade,
+    # which is well outside the 90-second late window.
+    _insert_trade(conn, 81, "ETHUSDT", 3500.0, 1.0, BASE_TIME)
+    _insert_trade(conn, 82, "ETHUSDT", 3510.0, 2.0, BASE_TIME + timedelta(seconds=30))
+    _process_batch(conn, from_expr="bronze.raw_trades")
+
+    candle = conn.execute(
+        "SELECT open_price, close_price, trade_count FROM silver.ohlcv_1m WHERE symbol = 'ETHUSDT'"
+    ).fetchall()
+    assert candle == [(3500.0, 3510.0, 2)]
+    assert conn.execute("SELECT COUNT(*) FROM silver.trades_clean WHERE symbol = 'ETHUSDT'").fetchone()[0] == 2
+
+
+def test_a_trade_later_than_its_own_symbols_window_is_still_left_out(conn):
+    """The per-symbol watermark does not widen the late window within a symbol."""
+    _insert_trade(conn, 90, "BTCUSDT", 67000.0, 0.1, BASE_TIME + timedelta(minutes=10))
+    _process_batch(conn, from_expr="bronze.raw_trades")
+
+    _insert_trade(conn, 91, "BTCUSDT", 66000.0, 0.1, BASE_TIME)
+    _process_batch(conn, from_expr="bronze.raw_trades")
+
+    assert conn.execute("SELECT COUNT(*) FROM silver.ohlcv_1m").fetchone()[0] == 1
+
+
+def test_trades_at_the_same_instant_open_and_close_in_trade_id_order(conn):
+    """One order filled at several prices gives trades with the same millisecond."""
+    # Inserted out of order, so the answer cannot come from the order of the rows
+    _insert_trade(conn, 102, "BTCUSDT", 67020.0, 0.1, BASE_TIME)
+    _insert_trade(conn, 100, "BTCUSDT", 67000.0, 0.1, BASE_TIME)
+    _insert_trade(conn, 101, "BTCUSDT", 67010.0, 0.1, BASE_TIME)
+
+    _process_batch(conn, from_expr="bronze.raw_trades")
+
+    assert conn.execute("SELECT open_price, close_price FROM silver.ohlcv_1m").fetchall() == [
+        (67000.0, 67020.0)
+    ]
+
+
+def test_a_batch_that_fails_changes_nothing(conn):
+    """The trades, the candles and the watermarks are written together."""
+    _insert_trade(conn, 110, "BTCUSDT", 67000.0, 0.1, BASE_TIME)
+    # A candle cannot be stored without a VWAP, and zero volume has none
+    _insert_trade(conn, 111, "ETHUSDT", 3500.0, 0.0, BASE_TIME)
+
+    with pytest.raises(duckdb.ConstraintException):
+        _process_batch(conn, from_expr="bronze.raw_trades")
+
+    for table in ("trades_clean", "ohlcv_1m", "_symbol_watermark"):
+        assert conn.execute(f"SELECT COUNT(*) FROM silver.{table}").fetchone()[0] == 0, table

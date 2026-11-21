@@ -7,8 +7,11 @@ Reads trade events from the `raw-trades` Kafka topic and writes them to:
 
 Bronze is the landing zone — data is written as-is with minimal transformation.
 The only guarantee the DuckDB table makes is uniqueness on (symbol, trade_id).
-The Parquet files can repeat a trade when Kafka redelivers it. The Silver
-processor collapses those on read.
+
+Delivery is at-least-once. Kafka offsets are committed only after the trades
+they cover are in a Parquet file, so a consumer that is killed re-reads what
+it had not yet flushed. The Parquet files can therefore repeat a trade. The
+Silver processor collapses those on read.
 
 Usage:
     uv run python -m consume.bronze_consumer
@@ -18,6 +21,7 @@ import json
 import os
 import signal
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +31,9 @@ import pyarrow.parquet as pq
 import structlog
 from confluent_kafka import Consumer, KafkaError, KafkaException
 from dotenv import load_dotenv
+from pydantic import ValidationError
+
+from ingest.schemas import TradeEvent
 
 load_dotenv()
 
@@ -87,20 +94,58 @@ def _make_consumer() -> Consumer:
             "group.id": CONSUMER_GROUP,
             # Start from earliest unprocessed offset (resumes after restarts)
             "auto.offset.reset": "earliest",
-            # Disable auto-commit — we commit after successful DuckDB write
+            # Disable auto-commit — offsets are committed after each Parquet flush
             "enable.auto.commit": False,
             "session.timeout.ms": 30000,
         }
     )
 
 
-def _flush_parquet(rows: list[dict], symbol_hint: str) -> None:
-    """Write accumulated rows to a timestamped Parquet file."""
+def _parse_trade(raw: bytes) -> dict | None:
+    """
+    Decode one Kafka message into a trade, or return None if it is not one.
+
+    The topic is checked against the same TradeEvent model the producer uses.
+    A message that is not valid JSON, lacks a field or has a value of the wrong
+    type is logged and skipped: raising here would stop the consumer before the
+    offset is committed, and it would read the same message again on restart.
+    """
+    try:
+        return TradeEvent.model_validate(json.loads(raw.decode())).to_kafka_value()
+    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError) as exc:
+        log.warning("message_skipped", error=str(exc))
+        return None
+
+
+def _insert_trade(conn: duckdb.DuckDBPyConnection, trade: dict) -> None:
+    # INSERT OR IGNORE keeps the DuckDB table free of redelivered trades
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO raw.raw_trades
+            (trade_id, symbol, price, quantity, trade_time, received_at, is_buyer_maker)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            trade["trade_id"],
+            trade["symbol"],
+            trade["price"],
+            trade["quantity"],
+            trade["trade_time"],
+            trade["received_at"],
+            trade["is_buyer_maker"],
+        ],
+    )
+
+
+def _flush_parquet(rows: list[dict]) -> Path | None:
+    """Write accumulated rows to a new Parquet file and return its path."""
     if not rows:
-        return
+        return None
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)
+    symbols = "_".join(sorted({row["symbol"] for row in rows}))
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S")
-    path = BRONZE_DIR / f"trades_{symbol_hint}_{ts}.parquet"
+    # Two flushes can fall in the same second, so the timestamp alone is not a unique name.
+    path = BRONZE_DIR / f"trades_{symbols}_{ts}_{uuid.uuid4().hex[:8]}.parquet"
     # Kafka values carry timestamps as ISO-8601 strings; Parquet stores them as timestamps
     records = [
         {
@@ -111,8 +156,28 @@ def _flush_parquet(rows: list[dict], symbol_hint: str) -> None:
         for row in rows
     ]
     table = pa.Table.from_pylist(records, schema=BRONZE_SCHEMA)
-    pq.write_table(table, str(path), compression="snappy")
+    # The Silver processor reads every *.parquet file here and may run at any
+    # moment. The file is written under another name and renamed when complete,
+    # so Silver never sees part of one.
+    partial = path.with_suffix(".parquet.tmp")
+    pq.write_table(table, str(partial), compression="snappy")
+    os.replace(partial, path)
     log.info("parquet_flushed", path=str(path), rows=len(rows))
+    return path
+
+
+def _flush_and_commit(buffer: list[dict], consumer: Consumer) -> None:
+    """
+    Write the buffered trades to Parquet, then commit the offsets that cover them.
+
+    The order is what makes a crash safe: until the file exists, the offsets
+    stay uncommitted and Kafka will deliver those trades again.
+    """
+    if not buffer:
+        return
+    _flush_parquet(buffer)
+    buffer.clear()
+    consumer.commit(asynchronous=False)
 
 
 def run_consumer() -> None:
@@ -126,7 +191,7 @@ def run_consumer() -> None:
     running = True
     last_flush_time = time.monotonic()
     # Flush every 30 seconds regardless of row count (handles low-volume feeds)
-    FLUSH_INTERVAL_SECONDS = int(os.getenv("PARQUET_FLUSH_INTERVAL_SECONDS", "30"))
+    flush_interval_seconds = int(os.getenv("PARQUET_FLUSH_INTERVAL_SECONDS", "30"))
 
     def _shutdown(*_):
         nonlocal running
@@ -141,11 +206,8 @@ def run_consumer() -> None:
             msg = consumer.poll(timeout=1.0)
 
             # Time-based flush — triggers even when no messages arrive
-            time_to_flush = (time.monotonic() - last_flush_time) >= FLUSH_INTERVAL_SECONDS
-            if buffer and time_to_flush:
-                symbols = {r["symbol"] for r in buffer}
-                _flush_parquet(buffer, "_".join(sorted(symbols)))
-                buffer.clear()
+            if buffer and (time.monotonic() - last_flush_time) >= flush_interval_seconds:
+                _flush_and_commit(buffer, consumer)
                 last_flush_time = time.monotonic()
 
             if msg is None:
@@ -155,41 +217,17 @@ def run_consumer() -> None:
                     continue
                 raise KafkaException(msg.error())
 
-            try:
-                event = json.loads(msg.value().decode())
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                log.warning("message_parse_error", error=str(exc))
+            trade = _parse_trade(msg.value())
+            if trade is None:
                 continue
 
-            # INSERT OR IGNORE keeps the DuckDB table free of redelivered trades
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO raw.raw_trades
-                    (trade_id, symbol, price, quantity, trade_time, received_at, is_buyer_maker)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    event["trade_id"],
-                    event["symbol"],
-                    event["price"],
-                    event["quantity"],
-                    event["trade_time"],
-                    event["received_at"],
-                    event["is_buyer_maker"],
-                ],
-            )
-
-            buffer.append(event)
+            _insert_trade(conn, trade)
+            buffer.append(trade)
             total_written += 1
-
-            # Commit offset after successful write
-            consumer.commit(asynchronous=True)
 
             # Row-count flush
             if len(buffer) >= PARQUET_FLUSH_ROWS:
-                symbols = {r["symbol"] for r in buffer}
-                _flush_parquet(buffer, "_".join(sorted(symbols)))
-                buffer.clear()
+                _flush_and_commit(buffer, consumer)
                 last_flush_time = time.monotonic()
 
             if total_written % 1000 == 0:
@@ -197,9 +235,7 @@ def run_consumer() -> None:
 
     finally:
         # Flush any remaining buffer rows before shutdown
-        if buffer:
-            symbols = {r["symbol"] for r in buffer}
-            _flush_parquet(buffer, "_".join(sorted(symbols)))
+        _flush_and_commit(buffer, consumer)
         consumer.close()
         conn.close()
         log.info("consumer_stopped", total_written=total_written)
