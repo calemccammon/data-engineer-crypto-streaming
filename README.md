@@ -6,7 +6,7 @@ A local streaming pipeline that reads live trades for BTC, ETH and SOL from the 
 
 ## Running it
 
-Prerequisites: Docker with Compose, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
+Prerequisites: Docker with Compose and [uv](https://docs.astral.sh/uv/). uv uses Python 3.12, the version in `.python-version`, and downloads it if it is missing. dbt does not yet import on Python 3.14.
 
 ```bash
 git clone https://github.com/calemccammon/data-engineer-crypto-streaming.git
