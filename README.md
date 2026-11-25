@@ -1,8 +1,17 @@
 # Crypto Streaming Pipeline
 
-A local streaming pipeline that reads live trades for BTC, ETH and SOL from the Binance.US public WebSocket, publishes them to a Kafka-compatible broker (Redpanda), and builds bronze, silver and gold layers in DuckDB. A Streamlit dashboard reads the result. Everything runs on one machine. The only external service is the public Binance.US market data stream, which needs no API key.
+A local streaming pipeline for live BTC, ETH and SOL trades. A producer reads the Binance.US public WebSocket into Redpanda (Kafka-compatible), a consumer lands the trades as Parquet, DuckDB builds one-minute candles from them, and dbt turns the candles into incremental gold tables. Dagster runs the batch steps, and a Streamlit dashboard reads the result. Everything runs on one machine; the only external service is the Binance.US market data stream, which needs no API key.
 
 ![Dashboard](docs/dashboard.png)
+
+The parts worth reading:
+
+- Kafka offsets are committed only after the trades they cover are in a Parquet file, and each file is written under a temporary name and then renamed, so a reader never sees half of one. Repeats from a restart are removed in silver.
+- Late trades are folded into their candle: each batch re-reads a trailing 90-second window, rounded down to the minute, and the watermark is kept per symbol so one fast symbol cannot skip another's backlog.
+- Rolling windows stay correct on incremental runs. The gold models compute their windows over every candle and filter afterwards, so the first rows of a run do not get a shortened window.
+- One test builds silver and gold from Parquet files through the Dagster assets, which puts every dbt model and dbt test in CI.
+
+[Bronze](#bronze), [Design decisions](#design-decisions) and [Testing](#testing) below go into each of these.
 
 ## Running it
 
@@ -53,7 +62,7 @@ Dagster can take over step 3 and the dbt commands. Stop the silver processor if 
 uv run dagster dev -m orchestrate -p 3001
 ```
 
-Open http://localhost:3001 and turn on `bronze_parquet_sensor`. Each time the bronze consumer writes a Parquet file, the sensor starts a run that processes one silver batch and then builds the dbt project, tests included.
+Open http://localhost:3001 and turn on `bronze_parquet_sensor`. New Parquet files then trigger a silver batch followed by `dbt build`.
 
 Without `DAGSTER_HOME`, `dagster dev` keeps its state in a temporary directory and the sensor cursor is lost on restart. To keep it, export `DAGSTER_HOME` as the absolute path of an existing directory before starting Dagster.
 
@@ -127,17 +136,7 @@ The bronze consumer checks each message against the same `TradeEvent` model the 
 
 Auto-commit is disabled. Offsets are committed after each flush, once the trades they cover are in a Parquet file. A consumer that is killed therefore reads its unflushed trades again when it restarts, and a file can repeat trades that an earlier file already holds. Delivery into bronze is at-least-once; silver removes the repeats.
 
-| Column | Type | Description |
-|---|---|---|
-| `trade_id` | BIGINT | Binance aggregate trade ID. Primary key together with `symbol` |
-| `symbol` | VARCHAR | For example `BTCUSDT` |
-| `price` | DOUBLE | Trade price |
-| `quantity` | DOUBLE | Trade quantity |
-| `trade_time` | TIMESTAMPTZ | When the trade executed on Binance |
-| `received_at` | TIMESTAMPTZ | When the producer parsed the message |
-| `is_buyer_maker` | BOOLEAN | True means the trade was sell-initiated |
-
-The Parquet files have the same columns. A trade that Kafka delivers twice is ignored by the DuckDB table but is written to Parquet again.
+The table and the Parquet files both hold `trade_id`, `symbol`, `price`, `quantity`, `trade_time` (when the trade executed on Binance), `received_at` (when the producer parsed it) and `is_buyer_maker` (true means the trade was sell-initiated). A trade that Kafka delivers twice is ignored by the DuckDB table but is written to Parquet again.
 
 ### Silver
 
@@ -171,7 +170,7 @@ The dashboard opens a read-only DuckDB connection for each query. The price tile
 
 - `bronze_raw_trades` is an external asset that stands for the bronze consumer's output. `silver_candles` runs one silver batch. `gold_models` runs `dbt build` in a subprocess, passing the absolute database path because dbt runs from `transform/`. `dbt build` creates the staging views before the gold models that read them, so the job works on a database dbt has never touched, and it runs every dbt test.
 - `bronze_parquet_sensor` lists `data/bronze/*.parquet` every 30 seconds, compares the file names with the set stored in its cursor, and requests one `silver_to_gold_job` run when new files have appeared.
-- `gold_refresh_5min` runs the same job on a five-minute cron schedule as a fallback.
+- `gold_refresh_5min` runs the same job on a five-minute cron schedule as a fallback. Because the sensor fires on new files, an idle feed starts no runs from it.
 
 ## Design decisions
 
@@ -187,24 +186,22 @@ The dashboard opens a read-only DuckDB connection for each query. The price tile
 
 **Gold models are incremental with `delete+insert`.** Silver rewrites a candle's `updated_at` each time it recomputes the candle. On an incremental run `gold_vwap` selects the candles whose `updated_at` is later than the newest value already in the gold table minus 2 minutes, deletes the rows with the same `symbol` and `candle_open`, and inserts the recomputed rows. The two models with rolling windows compute their windows over all silver candles first and then re-emit only the newest rows by `candle_open` (10 minutes for `gold_trade_flow`, 2 hours for `gold_rolling_volatility`). Filtering before the window functions would give the earliest rows of each run a shortened window. `gold_symbol_summary` is rebuilt in full on every run.
 
-**The sensor triggers on files, with a schedule as a fallback.** Runs are requested when the bronze consumer has written new Parquet files, so an idle feed causes no silver or dbt runs from the sensor.
-
 ## Testing
 
 ```bash
 uv run pytest tests/ -v
 ```
 
-There are 35 pytest cases, and GitHub Actions runs them on every push and pull request to `main`.
+GitHub Actions runs the tests on every push and pull request to `main`.
 
-| File | Cases | Covers |
-|---|---|---|
-| `tests/test_producer.py` | 6 | `TradeEvent` parsing from an `aggTrade` message, symbol upper-casing, JSON serialization, and a `ValidationError` for a non-numeric price and for a missing field |
-| `tests/test_bronze_consumer.py` | 15 | Messages that are not trades are skipped (six kinds); a redelivered trade is stored once; the Parquet writer's column values and timestamp types; two flushes in one second make two files; a file is not visible under `*.parquet` until it is complete; offsets are committed after the file exists, and not at all when the write fails |
-| `tests/test_silver_processor.py` | 12 | The silver batch SQL against a temporary DuckDB file: OHLC values, volume, buy and sell split, VWAP, minute boundaries, a repeated batch producing no duplicate candles, a candle that straddles the late-arrival cutoff, one trade ID shared by two symbols, a trade repeated in bronze, a symbol whose trades arrive behind another's, trades at the same instant, and a failed batch leaving nothing behind |
-| `tests/test_pipeline.py` | 2 | The Dagster definitions load. Starting from Parquet files and no database, the Dagster assets build silver and then run `dbt build`, twice, and the silver and gold row counts are checked |
+| File | Covers |
+|---|---|
+| `tests/test_producer.py` | `TradeEvent` parsing from an `aggTrade` message, symbol upper-casing, JSON serialization, and a `ValidationError` for a non-numeric price and for a missing field |
+| `tests/test_bronze_consumer.py` | Messages that are not trades are skipped; a redelivered trade is stored once; the Parquet writer's column values and timestamp types; two flushes in one second make two files; a file is not visible under `*.parquet` until it is complete; offsets are committed after the file exists, and not at all when the write fails |
+| `tests/test_silver_processor.py` | The silver batch SQL against a temporary DuckDB file: OHLC values, volume, buy and sell split, VWAP, minute boundaries, a repeated batch producing no duplicate candles, a candle that straddles the late-arrival cutoff, one trade ID shared by two symbols, a trade repeated in bronze, a symbol whose trades arrive behind another's, trades at the same instant, and a failed batch leaving nothing behind |
+| `tests/test_pipeline.py` | The Dagster definitions load. Starting from Parquet files and no database, the Dagster assets build silver and then run `dbt build`, twice, and the silver and gold row counts are checked |
 
-The dbt project defines 18 schema tests (`not_null`, `unique`, `accepted_values`) and one singular test, `assert_valid_ohlc`, which fails if a candle has a high below its low or an open or close outside the high-low range. `tests/test_pipeline.py` runs them all, against the tables it builds.
+The dbt project defines schema tests (`not_null`, `unique`, `accepted_values`) and one singular test, `assert_valid_ohlc`, which fails if a candle has a high below its low or an open or close outside the high-low range. `tests/test_pipeline.py` runs them all, against the tables it builds.
 
 The producer loop, the bronze consumer's Kafka loop and the dashboard have no automated tests.
 
